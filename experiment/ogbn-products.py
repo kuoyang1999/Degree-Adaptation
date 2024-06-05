@@ -1,113 +1,172 @@
 import argparse
-import os.path as osp
-import time
 
 import torch
 import torch.nn.functional as F
 
 import torch_geometric.transforms as T
-from torch_geometric.datasets import Planetoid
-from torch_geometric.logging import init_wandb, log
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, SAGEConv
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', type=str, default='Cora')
-parser.add_argument('--hidden_channels', type=int, default=16)
-parser.add_argument('--lr', type=float, default=0.01)
-parser.add_argument('--epochs', type=int, default=200)
-parser.add_argument('--use_gdc', action='store_true', help='Use GDC')
-parser.add_argument('--wandb', action='store_true', help='Track experiment')
-args = parser.parse_args()
+from ogb.nodeproppred import PygNodePropPredDataset, Evaluator
 
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    device = torch.device('mps')
-else:
-    device = torch.device('cpu')
-
-init_wandb(
-    name=f'GCN-{args.dataset}',
-    lr=args.lr,
-    epochs=args.epochs,
-    hidden_channels=args.hidden_channels,
-    device=device,
-)
-
-path = osp.join(osp.dirname(osp.realpath(__file__)), '..', 'data', 'Planetoid')
-dataset = Planetoid(path, args.dataset, transform=T.NormalizeFeatures())
-data = dataset[0].to(device)
-
-if args.use_gdc:
-    transform = T.GDC(
-        self_loop_weight=1,
-        normalization_in='sym',
-        normalization_out='col',
-        diffusion_kwargs=dict(method='ppr', alpha=0.05),
-        sparsification_kwargs=dict(method='topk', k=128, dim=0),
-        exact=True,
-    )
-    data = transform(data)
+from logger import Logger
 
 
 class GCN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
-        super().__init__()
-        self.conv1 = GCNConv(in_channels, hidden_channels,
-                             normalize=not args.use_gdc)
-        self.conv2 = GCNConv(hidden_channels, out_channels,
-                             normalize=not args.use_gdc)
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
+                 dropout):
+        super(GCN, self).__init__()
 
-    def forward(self, x, edge_index, edge_weight=None):
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.conv1(x, edge_index, edge_weight).relu()
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.conv2(x, edge_index, edge_weight)
-        return x
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(
+            GCNConv(in_channels, hidden_channels, normalize=False))
+        for _ in range(num_layers - 2):
+            self.convs.append(
+                GCNConv(hidden_channels, hidden_channels, normalize=False))
+        self.convs.append(
+            GCNConv(hidden_channels, out_channels, normalize=False))
+
+        self.dropout = dropout
+
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+
+    def forward(self, x, adj_t):
+        for conv in self.convs[:-1]:
+            x = conv(x, adj_t)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.convs[-1](x, adj_t)
+        return torch.log_softmax(x, dim=-1)
 
 
-model = GCN(
-    in_channels=dataset.num_features,
-    hidden_channels=args.hidden_channels,
-    out_channels=dataset.num_classes,
-).to(device)
+class SAGE(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
+                 dropout):
+        super(SAGE, self).__init__()
 
-optimizer = torch.optim.Adam([
-    dict(params=model.conv1.parameters(), weight_decay=5e-4),
-    dict(params=model.conv2.parameters(), weight_decay=0)
-], lr=args.lr)  # Only perform weight-decay on first convolution.
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(SAGEConv(in_channels, hidden_channels))
+        for _ in range(num_layers - 2):
+            self.convs.append(SAGEConv(hidden_channels, hidden_channels))
+        self.convs.append(SAGEConv(hidden_channels, out_channels))
+
+        self.dropout = dropout
+
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+
+    def forward(self, x, adj_t):
+        for conv in self.convs[:-1]:
+            x = conv(x, adj_t)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.convs[-1](x, adj_t)
+        return torch.log_softmax(x, dim=-1)
 
 
-def train():
+def train(model, data, train_idx, optimizer):
     model.train()
+
     optimizer.zero_grad()
-    out = model(data.x, data.edge_index, data.edge_attr)
-    loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask])
+    out = model(data.x, data.adj_t)[train_idx]
+    loss = F.nll_loss(out, data.y.squeeze(1)[train_idx])
     loss.backward()
     optimizer.step()
-    return float(loss)
+
+    return loss.item()
 
 
 @torch.no_grad()
-def test():
+def test(model, data, split_idx, evaluator):
     model.eval()
-    pred = model(data.x, data.edge_index, data.edge_attr).argmax(dim=-1)
 
-    accs = []
-    for mask in [data.train_mask, data.val_mask, data.test_mask]:
-        accs.append(int((pred[mask] == data.y[mask]).sum()) / int(mask.sum()))
-    return accs
+    out = model(data.x, data.adj_t)
+    y_pred = out.argmax(dim=-1, keepdim=True)
+
+    train_acc = evaluator.eval({
+        'y_true': data.y[split_idx['train']],
+        'y_pred': y_pred[split_idx['train']],
+    })['acc']
+    valid_acc = evaluator.eval({
+        'y_true': data.y[split_idx['valid']],
+        'y_pred': y_pred[split_idx['valid']],
+    })['acc']
+    test_acc = evaluator.eval({
+        'y_true': data.y[split_idx['test']],
+        'y_pred': y_pred[split_idx['test']],
+    })['acc']
+
+    return train_acc, valid_acc, test_acc
 
 
-best_val_acc = test_acc = 0
-times = []
-for epoch in range(1, args.epochs + 1):
-    start = time.time()
-    loss = train()
-    train_acc, val_acc, tmp_test_acc = test()
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        test_acc = tmp_test_acc
-    log(Epoch=epoch, Loss=loss, Train=train_acc, Val=val_acc, Test=test_acc)
-    times.append(time.time() - start)
-print(f'Median time per epoch: {torch.tensor(times).median():.4f}s')
+def main():
+    parser = argparse.ArgumentParser(description='OGBN-Products (GNN)')
+    parser.add_argument('--device', type=int, default=0)
+    parser.add_argument('--log_steps', type=int, default=1)
+    parser.add_argument('--use_sage', action='store_true')
+    parser.add_argument('--num_layers', type=int, default=3)
+    parser.add_argument('--hidden_channels', type=int, default=256)
+    parser.add_argument('--dropout', type=float, default=0.5)
+    parser.add_argument('--lr', type=float, default=0.01)
+    parser.add_argument('--epochs', type=int, default=300)
+    parser.add_argument('--runs', type=int, default=10)
+    args = parser.parse_args()
+    print(args)
+
+    device = f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device)
+
+    dataset = PygNodePropPredDataset(name='ogbn-products',
+                                     transform=T.ToSparseTensor())
+    data = dataset[0]
+
+    split_idx = dataset.get_idx_split()
+    train_idx = split_idx['train'].to(device)
+
+    if args.use_sage:
+        model = SAGE(data.num_features, args.hidden_channels,
+                     dataset.num_classes, args.num_layers,
+                     args.dropout).to(device)
+    else:
+        model = GCN(data.num_features, args.hidden_channels,
+                    dataset.num_classes, args.num_layers,
+                    args.dropout).to(device)
+
+        # Pre-compute GCN normalization.
+        adj_t = data.adj_t.set_diag()
+        deg = adj_t.sum(dim=1).to(torch.float)
+        deg_inv_sqrt = deg.pow(-0.5)
+        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+        adj_t = deg_inv_sqrt.view(-1, 1) * adj_t * deg_inv_sqrt.view(1, -1)
+        data.adj_t = adj_t
+
+    data = data.to(device)
+
+    evaluator = Evaluator(name='ogbn-products')
+    logger = Logger(args.runs, args)
+
+    for run in range(args.runs):
+        model.reset_parameters()
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        for epoch in range(1, 1 + args.epochs):
+            loss = train(model, data, train_idx, optimizer)
+            result = test(model, data, split_idx, evaluator)
+            logger.add_result(run, result)
+
+            if epoch % args.log_steps == 0:
+                train_acc, valid_acc, test_acc = result
+                print(f'Run: {run + 1:02d}, '
+                      f'Epoch: {epoch:02d}, '
+                      f'Loss: {loss:.4f}, '
+                      f'Train: {100 * train_acc:.2f}%, '
+                      f'Valid: {100 * valid_acc:.2f}% '
+                      f'Test: {100 * test_acc:.2f}%')
+
+        logger.print_statistics(run)
+    logger.print_statistics()
+
+
+if __name__ == "__main__":
+    main()
